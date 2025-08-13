@@ -12,23 +12,37 @@ from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ---------- ENV ----------
+# ================== ENV ==================
 load_dotenv()  # harmless on Railway; it uses Variables tab
-BOT_TOKEN = os.getenv("BOT")           # set in Railway Variables
-GROQ_API_KEY = os.getenv("GROQ")       # set in Railway Variables
-EXCEL_FILE = "requests.xlsx"
 
-def _mask(v: str, show=6):
+def _clean_env(name: str) -> str | None:
+    """Read env var and strip whitespace; return None if empty."""
+    v = os.getenv(name)
+    if v is None:
+        return None
+    v = v.strip()
+    return v or None
+
+BOT_TOKEN   = _clean_env("BOT")   # Telegram Bot token
+GROQ_API_KEY = _clean_env("GROQ") # Groq API key
+EXCEL_FILE  = "requests.xlsx"
+
+def _mask(v: str | None, head=6, tail=4) -> str:
     if not v: return "None"
-    return v[:show] + "…" + v[-4:]
+    if len(v) <= head + tail: return v
+    return f"{v[:head]}…{v[-tail:]}"
 
-# fail fast with clear logs (without leaking full secrets)
+# Fail fast with clear log (without leaking full secrets)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logging.info("Starting bot with env -> BOT=%s, GROQ=%s", _mask(BOT_TOKEN), _mask(GROQ_API_KEY))
+
 if not BOT_TOKEN or not GROQ_API_KEY:
-    logging.error("Missing env vars. BOT=%s, GROQ=%s",
-                  _mask(BOT_TOKEN), _mask(GROQ_API_KEY))
-    raise ValueError("Missing BOT or GROQ environment variables.")
+    raise ValueError("Missing BOT or GROQ environment variables. Check Railway → Variables.")
 
-# ---------- Prompt ----------
+# ================== SYSTEM PROMPT ==================
 SYSTEM_PROMPT = """
 أنت مساعد افتراضي رسمي لجمعية حفظ النعمة بمنطقة حائل. دورك خدمة:
 1) المتبرعين بفائض الطعام/الأثاث/الملابس،
@@ -38,40 +52,36 @@ SYSTEM_PROMPT = """
 
 منطقة الخدمة: مدينة حائل والمراكز التابعة لها.
 أوقات العمل: من الأحد إلى الخميس، 8:00 صباحًا – 9:00 مساءً.
-رقم التواصل: 0551965445.
-سياسات السلامة: رفض الطعام غير المعبأ أو غير الآمن، حفظ سرية البيانات.
+رقم التواصل/واتساب الأعمال: 0551965445.
+سياسات السلامة: قبول الطعام المعبأ أو المطهي حديثًا وفق معايير السلامة، ورفض أي تبرع غير آمن. حفظ سرية البيانات.
 صنّف الرسائل إلى: DONATION_FOOD / BENEFICIARY_REQUEST / VOLUNTEER_SIGNUP / OTHER.
-أجب بطريقة ودودة، مختصرة، ومنظمة.
+أجب بالعربية الفصحى المبسطة، مختصرًا وعمليًا، واطلب الحقول الناقصة عند الحاجة.
 """
 
-# ---------- Logging ----------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-
-# ---------- Groq ----------
+# ================== GROQ ==================
 client = Groq(api_key=GROQ_API_KEY)
 
 def ask_groq(user_message: str) -> str:
+    """Get reply from Groq with safety logging."""
     try:
-        res = client.chat.completions.create(
-            model="llama3-8b-8192",
+        resp = client.chat.completions.create(
+            model="llama3-8b-8192",  # or "llama3-70b-8192" if you prefer
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
             temperature=0.4,
         )
-        reply = res.choices[0].message.content
+        reply = resp.choices[0].message.content
         logging.info("Groq reply OK")
         return reply
     except Exception as e:
         logging.error("Groq Error: %s", e)
         return "⚠️ عذرًا، حدث خطأ أثناء الاتصال بالنموذج."
 
-# ---------- Storage ----------
+# ================== STORAGE ==================
 def save_to_excel(row: dict):
+    """Append a row to Excel (ephemeral on Railway; use Sheets/DB for persistence)."""
     try:
         if os.path.exists(EXCEL_FILE):
             df = pd.read_excel(EXCEL_FILE, engine="openpyxl")
@@ -82,7 +92,7 @@ def save_to_excel(row: dict):
     except Exception as e:
         logging.error("Excel save error: %s", e)
 
-# ---------- Intent ----------
+# ================== INTENT ==================
 def detect_intent(text: str) -> str:
     t = text or ""
     if "تبرع" in t:
@@ -93,9 +103,10 @@ def detect_intent(text: str) -> str:
         return "VOLUNTEER_SIGNUP"
     return "OTHER"
 
-# ---------- Handlers ----------
+# ================== HANDLERS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info("Received /start from %s", update.effective_user.username)
+    user = update.effective_user
+    logging.info("Received /start from @%s (%s)", user.username, user.id)
     await update.message.reply_text("مرحبًا! أنا مساعد جمعية حفظ النعمة بحائل. كيف أقدر أخدمك؟")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,10 +130,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error("handle_message error: %s", e)
         await update.message.reply_text("⚠️ حدث خطأ أثناء معالجة رسالتك.")
 
-# ---------- Run ----------
+# ================== RUN ==================
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logging.info("Bot starting… BOT=%s, GROQ=%s", _mask(BOT_TOKEN), _mask(GROQ_API_KEY))
+    logging.info("Bot starting…")
     app.run_polling()
