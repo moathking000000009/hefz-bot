@@ -2,86 +2,92 @@
 import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-import logging
-import os
+import logging, os, re
 from datetime import datetime
-
 import pandas as pd
 from dotenv import load_dotenv
 from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ================== ENV ==================
-load_dotenv()  # harmless on Railway; it uses Variables tab
+# ---------------- ENV LOADING & SANITIZING ----------------
+load_dotenv()
 
-def _clean_env(name: str) -> str | None:
-    """Read env var and strip whitespace; return None if empty."""
+def clean_env(name: str) -> str | None:
+    """
+    Read an env var and sanitize common mistakes:
+    - trim whitespace
+    - strip quotes
+    - if value accidentally includes 'NAME=VALUE', keep VALUE
+    - drop a stray leading '='
+    """
     v = os.getenv(name)
-    if v is None:
-        return None
-    v = v.strip()
+    if v is None: return None
+    v = v.strip().strip('"').strip("'")
+    if v.startswith(name + "="):
+        v = v.split("=", 1)[1].strip()
+    if v.startswith("="):
+        v = v[1:].strip()
     return v or None
 
-BOT_TOKEN   = _clean_env("BOT")   # Telegram Bot token
-GROQ_API_KEY = _clean_env("GROQ") # Groq API key
-EXCEL_FILE  = "requests.xlsx"
+BOT_TOKEN    = clean_env("BOT")
+GROQ_API_KEY = clean_env("GROQ")
+EXCEL_FILE   = "requests.xlsx"
 
-def _mask(v: str | None, head=6, tail=4) -> str:
+def mask(v: str | None, head=6, tail=4) -> str:
     if not v: return "None"
-    if len(v) <= head + tail: return v
-    return f"{v[:head]}…{v[-tail:]}"
+    return v[:head] + "…" + v[-tail:] if len(v) > head + tail else v
 
-# Fail fast with clear log (without leaking full secrets)
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logging.info("Starting bot with env -> BOT=%s, GROQ=%s", _mask(BOT_TOKEN), _mask(GROQ_API_KEY))
+# Validate formats early (approx patterns)
+tg_pat   = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
+groq_pat = re.compile(r"^gsk_[A-Za-z0-9]{20,}$")
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                    level=logging.INFO)
+logging.info("Boot env → BOT=%s, GROQ=%s", mask(BOT_TOKEN), mask(GROQ_API_KEY))
 
 if not BOT_TOKEN or not GROQ_API_KEY:
-    raise ValueError("Missing BOT or GROQ environment variables. Check Railway → Variables.")
+    raise ValueError("Missing BOT or GROQ environment variables (Railway → Variables).")
 
-# ================== SYSTEM PROMPT ==================
+if not tg_pat.match(BOT_TOKEN):
+    raise ValueError(f"Telegram token looks invalid after sanitizing: '{BOT_TOKEN[:8]}…'")
+
+if not groq_pat.match(GROQ_API_KEY):
+    raise ValueError("GROQ key looks invalid after sanitizing.")
+
+# ---------------- SYSTEM PROMPT ----------------
 SYSTEM_PROMPT = """
 أنت مساعد افتراضي رسمي لجمعية حفظ النعمة بمنطقة حائل. دورك خدمة:
 1) المتبرعين بفائض الطعام/الأثاث/الملابس،
 2) المستفيدين (الأسر المحتاجة)،
 3) المتطوعين،
 4) الاستفسارات العامة والشكاوى.
-
 منطقة الخدمة: مدينة حائل والمراكز التابعة لها.
 أوقات العمل: من الأحد إلى الخميس، 8:00 صباحًا – 9:00 مساءً.
-رقم التواصل/واتساب الأعمال: 0551965445.
-سياسات السلامة: قبول الطعام المعبأ أو المطهي حديثًا وفق معايير السلامة، ورفض أي تبرع غير آمن. حفظ سرية البيانات.
+رقم التواصل/واتساب: 0551965445.
+سياسات السلامة: قبول الطعام المعبأ أو المطهي حديثًا وفق معايير السلامة، ورفض غير الآمن. حفظ سرية البيانات.
 صنّف الرسائل إلى: DONATION_FOOD / BENEFICIARY_REQUEST / VOLUNTEER_SIGNUP / OTHER.
-أجب بالعربية الفصحى المبسطة، مختصرًا وعمليًا، واطلب الحقول الناقصة عند الحاجة.
+أجب بالعربية المختصرة واطلب الحقول الناقصة.
 """
 
-# ================== GROQ ==================
+# ---------------- GROQ ----------------
 client = Groq(api_key=GROQ_API_KEY)
 
 def ask_groq(user_message: str) -> str:
-    """Get reply from Groq with safety logging."""
     try:
-        resp = client.chat.completions.create(
-            model="llama3-8b-8192",  # or "llama3-70b-8192" if you prefer
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
+        res = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role":"system","content":SYSTEM_PROMPT},
+                      {"role":"user","content":user_message}],
             temperature=0.4,
         )
-        reply = resp.choices[0].message.content
-        logging.info("Groq reply OK")
-        return reply
+        return res.choices[0].message.content
     except Exception as e:
         logging.error("Groq Error: %s", e)
         return "⚠️ عذرًا، حدث خطأ أثناء الاتصال بالنموذج."
 
-# ================== STORAGE ==================
+# ---------------- STORAGE ----------------
 def save_to_excel(row: dict):
-    """Append a row to Excel (ephemeral on Railway; use Sheets/DB for persistence)."""
     try:
         if os.path.exists(EXCEL_FILE):
             df = pd.read_excel(EXCEL_FILE, engine="openpyxl")
@@ -92,21 +98,16 @@ def save_to_excel(row: dict):
     except Exception as e:
         logging.error("Excel save error: %s", e)
 
-# ================== INTENT ==================
+# ---------------- INTENT ----------------
 def detect_intent(text: str) -> str:
     t = text or ""
-    if "تبرع" in t:
-        return "DONATION_FOOD"
-    if "سلة" in t or "مساعدة" in t:
-        return "BENEFICIARY_REQUEST"
-    if "تطوع" in t:
-        return "VOLUNTEER_SIGNUP"
+    if "تبرع" in t: return "DONATION_FOOD"
+    if "سلة" in t or "مساعدة" in t: return "BENEFICIARY_REQUEST"
+    if "تطوع" in t: return "VOLUNTEER_SIGNUP"
     return "OTHER"
 
-# ================== HANDLERS ==================
+# ---------------- HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    logging.info("Received /start from @%s (%s)", user.username, user.id)
     await update.message.reply_text("مرحبًا! أنا مساعد جمعية حفظ النعمة بحائل. كيف أقدر أخدمك؟")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,13 +125,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "message": user_text,
             "reply": reply,
         })
-
         await update.message.reply_text(reply if reply else "⚠️ لم أتمكن من معالجة رسالتك.")
     except Exception as e:
         logging.error("handle_message error: %s", e)
         await update.message.reply_text("⚠️ حدث خطأ أثناء معالجة رسالتك.")
 
-# ================== RUN ==================
+# ---------------- RUN ----------------
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
