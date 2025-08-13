@@ -13,8 +13,8 @@ from datetime import datetime
 
 # ====== تحميل القيم من ملف .env ======
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+BOT_TOKEN = os.getenv("BOT")
+GROQ_API_KEY = os.getenv("GROQ")
 EXCEL_FILE = "requests.xlsx"
 
 # ====== System Prompt ======
@@ -127,3 +127,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logging.info("✅ البوت يعمل باستخدام Groq API...")
     app.run_polling()
+
