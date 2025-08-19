@@ -1,5 +1,20 @@
+# Core dashboard dependencies
+streamlit==1.28.1
+pandas==2.1.4
+plotly==5.17.0
+
+# Excel/CSV support
+openpyxl==3.1.2
+
+# Environment and utilities
+python-dotenv==1.0.0
+
+# Additional utilities
+python-dateutil==2.8.2
+
+# Telegram Bot dependencies (for real bot functionality)
 python-telegram-bot==20.7
-groq
-pandas
-openpyxl
-python-dotenv
+groq==0.4.2
+
+# HTTP requests
+requests==2.31.0
